@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#234c3e" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#12150f" media="(prefers-color-scheme: dark)" />
+    <script>
+      // Paint the stored (or system) theme before the first frame, so there is no flash of the wrong one.
+      try {
+        var saved = localStorage.getItem('little-budget-theme')
+        document.documentElement.dataset.theme = saved === 'light' || saved === 'dark' ? saved
+          : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+      } catch (error) { document.documentElement.dataset.theme = 'light' }
+    </script>
+    <meta name="description" content="A little space to plan your purchases. Organize your wishlist and see what fits your budget." />
+    <title>Little Budget — Make room for what matters</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
