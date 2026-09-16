@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { emptyPlan, examplePlan, exportFilename, lineTotal, movePurchase, normalizeLink, safeLink, exportLibrary, exportPlan, importFile, isAlternative, isIncluded, newLibrary, optionAmount, parseAmount, summarize, upgradePlan, validateLibrary, validatePlan, withFreshId, withValidSelection, type Plan } from './budget'
+import { boughtScope, deleteCategory, deleteChoice, deletePurchase, emptyPlan, examplePlan, exportFilename, layoutOf, lineTotal, moveCategory, moveChoice, moveOption, movePurchase, normalizeLink, safeLink, exportPlan, isAlternative, isIncluded, optionAmount, parseAmount, setBought, summarize, upgradePlan, validatePlan, withFreshId, withValidSelection, type Plan } from './budget'
+import { exampleBudget } from './household'
 import { copy, languages } from './i18n'
+import { exportLibrary, importFile, newLibrary, validateLibrary } from './library'
+
+const budgetExample = () => exampleBudget(copy.en.exampleBudget, copy.en.budgetCategories)
 
 const PLANNED = 90700
 const BUDGET = 0
@@ -119,6 +123,28 @@ describe('quantity, priority and status', () => {
     expect(summarize(dropped).planned).toBe(PLANNED - 8900)
     expect(optionAmount(dropped, 'shelf-narrow')).toBe(0)
   })
+  it('marks what counts in a category or either-or as bought, and back', () => {
+    const plan = example()
+    // The office counts its chair, its lamp and the picked 60 cm shelf; the 90 cm shelf lost the pick.
+    const office = boughtScope(plan, { categoryId: 'office' }).map(i => i.id)
+    expect(office).toEqual(['chair', 'lamp', 'shelf-60'])
+    const bought = setBought(plan, office, true)
+    expect(summarize(bought).spent).toBe(4500 + 22900 + 5900 + 8900)
+    expect(bought.items.find(i => i.id === 'shelf-90')!.status).toBe('planned')
+    expect(summarize(setBought(bought, office, false)).spent).toBe(4500)
+    expect(boughtScope(plan, { choiceId: 'coffee' }).map(i => i.id)).toEqual(['espresso', 'grinder'])
+    expect(boughtScope(plan, { categoryId: null }).map(i => i.id)).toEqual(['espresso', 'grinder', 'frames'])
+    expect(boughtScope(plan, { categoryId: 'garden' })).toEqual([])
+    // A switched-off either-or counts for nothing, so marking its category leaves it alone.
+    const coffeeOff = { ...plan, choices: plan.choices.map(c => c.id === 'coffee' ? { ...c, enabled: false } : c) }
+    expect(boughtScope(coffeeOff, { categoryId: null }).map(i => i.id)).toEqual(['frames'])
+    expect(boughtScope(coffeeOff, { choiceId: 'coffee' })).toEqual([])
+  })
+  it('only changes a purchase that is no longer needed when it is bought after all', () => {
+    const plan = example()
+    expect(setBought(plan, ['toolbox'], false).items.find(i => i.id === 'toolbox')!.status).toBe('dropped')
+    expect(setBought(plan, ['toolbox'], true).items.find(i => i.id === 'toolbox')!.status).toBe('bought')
+  })
   it('rejects a quantity that is not a whole number of pieces', () => {
     for (const quantity of [0, -1, 1.5, 1000]) {
       const plan = example()
@@ -201,6 +227,96 @@ describe('moving and reordering purchases', () => {
   })
 })
 
+describe('rearranging categories and either-ors', () => {
+  const ids = (list: { id: string }[]) => list.map(entry => entry.id)
+  it('puts a category in front of another, or last', () => {
+    const plan = example()
+    expect(ids(moveCategory(plan, { id: 'garden', before: 'kitchen' }).categories)).toEqual(['garden', 'kitchen', 'office'])
+    expect(ids(moveCategory(plan, { id: 'kitchen', before: null }).categories)).toEqual(['office', 'garden', 'kitchen'])
+    expect(summarize(moveCategory(plan, { id: 'garden', before: 'kitchen' })).planned).toBe(PLANNED)
+  })
+  it('takes the purchases of an either-or along into another category', () => {
+    const plan = example()
+    const moved = moveChoice(plan, { id: 'coffee', categoryId: 'office', before: 'shelf' })
+    expect(ids(moved.choices)).toEqual(['coffee', 'shelf'])
+    expect(moved.choices[0].categoryId).toBe('office')
+    expect(moved.items.filter(i => i.optionId?.startsWith('coffee-')).map(i => i.categoryId)).toEqual(['office', 'office', 'office'])
+    expect(validatePlan(moved)).toBe(true)
+    expect(summarize(moved).planned).toBe(PLANNED)
+  })
+  it('stops counting an either-or moved into a switched-off category, keeping its pick', () => {
+    const moved = moveChoice(example(), { id: 'coffee', categoryId: 'garden', before: null })
+    expect(validatePlan(moved)).toBe(true)
+    expect(summarize(moved).planned).toBe(PLANNED - 34800)
+    expect(moved.choices.find(c => c.id === 'coffee')!.selectedId).toBe('coffee-manual')
+  })
+  it('leaves the plan alone for a move that says nothing', () => {
+    const plan = example()
+    expect(moveCategory(plan, { id: 'kitchen', before: 'kitchen' })).toBe(plan)
+    expect(moveCategory(plan, { id: 'nowhere', before: null })).toBe(plan)
+    expect(moveChoice(plan, { id: 'shelf', categoryId: 'office', before: 'shelf' })).toBe(plan)
+    expect(moveChoice(plan, { id: 'nowhere', categoryId: null, before: null })).toBe(plan)
+  })
+})
+
+// What a category shows directly, in order.
+const shownIn = (plan: Plan, categoryId: string | null) => layoutOf(plan).filter(id =>
+  plan.items.some(item => item.id === id && item.categoryId === categoryId) || plan.choices.some(choice => choice.id === id && choice.categoryId === categoryId))
+
+describe('purchases and either-ors in one order', () => {
+  it('starts with purchases above either-ors, as plans always showed them', () => {
+    expect(shownIn(example(), 'office')).toEqual(['chair', 'lamp', 'shelf'])
+  })
+  it('puts a purchase behind an either-or, and an either-or between purchases', () => {
+    const plan = example()
+    expect(shownIn(movePurchase(plan, { id: 'chair', categoryId: 'office', optionId: null, before: null }), 'office')).toEqual(['lamp', 'shelf', 'chair'])
+    const between = moveChoice(plan, { id: 'shelf', categoryId: 'office', before: 'lamp' })
+    expect(shownIn(between, 'office')).toEqual(['chair', 'shelf', 'lamp'])
+    expect(validatePlan(between)).toBe(true)
+  })
+  it('keeps a purchase out of the order while it sits in an option', () => {
+    const moved = movePurchase(example(), { id: 'lamp', categoryId: 'office', optionId: 'shelf-wide', before: null })
+    expect(moved.layout).not.toContain('lamp')
+    expect(shownIn(moved, 'office')).toEqual(['chair', 'shelf'])
+  })
+  it('reorders the options of an either-or, and only within it', () => {
+    const moved = moveOption(example(), { id: 'shelf-wide', before: 'shelf-narrow' })
+    expect(moved.choices.find(choice => choice.id === 'shelf')!.options.map(option => option.id)).toEqual(['shelf-wide', 'shelf-narrow'])
+    expect(validatePlan(moved)).toBe(true)
+    const plan = example()
+    expect(moveOption(plan, { id: 'shelf-wide', before: 'shelf-wide' })).toBe(plan)
+    expect(moveOption(plan, { id: 'nowhere', before: null })).toBe(plan)
+  })
+})
+
+describe('deleting', () => {
+  it('deletes one purchase', () => {
+    const deleted = deletePurchase(example(), 'lamp')
+    expect(deleted.items.map(item => item.id)).not.toContain('lamp')
+    expect(deleted.layout).not.toContain('lamp')
+  })
+  it('keeps an either-or’s purchases where it stood, or deletes them with it', () => {
+    const kept = deleteChoice(example(), 'shelf', false)
+    expect(shownIn(kept, 'office')).toEqual(['chair', 'lamp', 'shelf-60', 'shelf-90'])
+    expect(validatePlan(kept)).toBe(true)
+    const gone = deleteChoice(example(), 'shelf', true)
+    expect(gone.items.map(item => item.id)).not.toContain('shelf-60')
+    expect(shownIn(gone, 'office')).toEqual(['chair', 'lamp'])
+    expect(validatePlan(gone)).toBe(true)
+  })
+  it('moves a category’s contents to Uncategorized, or deletes them with it', () => {
+    const kept = deleteCategory(example(), 'office', false)
+    expect(kept.categories.map(category => category.id)).not.toContain('office')
+    expect(shownIn(kept, null)).toEqual(['chair', 'lamp', 'frames', 'toolbox', 'shelf', 'coffee'])
+    expect(kept.items.filter(item => ['chair', 'shelf-60'].includes(item.id)).map(item => item.categoryId)).toEqual([null, null])
+    expect(validatePlan(kept)).toBe(true)
+    const gone = deleteCategory(example(), 'office', true)
+    expect(gone.items.some(item => ['chair', 'lamp', 'shelf-60', 'shelf-90'].includes(item.id))).toBe(false)
+    expect(gone.choices.map(choice => choice.id)).toEqual(['coffee'])
+    expect(validatePlan(gone)).toBe(true)
+  })
+})
+
 describe('input and stored data', () => {
   it('accepts decimal and comma amounts, including zero', () => {
     expect(parseAmount('12.34')).toBe(1234)
@@ -236,7 +352,7 @@ describe('input and stored data', () => {
     expect(validatePlan(straySelection)).toBe(false)
   })
   it('validates a library and its active plan', () => {
-    const library = newLibrary(example())
+    const library = newLibrary(example(), budgetExample())
     expect(validateLibrary(library)).toBe(true)
     expect(validateLibrary({ ...library, activeId: 'gone' })).toBe(false)
     expect(validateLibrary({ ...library, plans: [] })).toBe(false)
@@ -267,13 +383,13 @@ describe('export and import', () => {
     expect(importFile(exportPlan(plan))).toEqual({ kind: 'plan', plan })
   })
   it('carries every plan through an export of the whole library', () => {
-    const library = { ...newLibrary(example()), plans: [example(), emptyPlan('Second')] }
+    const library = { ...newLibrary(example(), budgetExample()), plans: [example(), emptyPlan('Second')] }
     const restored = importFile(exportLibrary({ ...library, activeId: library.plans[0].id }))
     expect(restored?.kind).toBe('library')
     expect(restored?.kind === 'library' && restored.library.plans.map(p => p.name)).toEqual(['Example plan', 'Second'])
   })
   it('repairs a library whose active plan is missing', () => {
-    const library = newLibrary(example())
+    const library = newLibrary(example(), budgetExample())
     const restored = importFile(exportLibrary({ ...library, activeId: 'gone' }))
     expect(restored?.kind === 'library' && restored.library.activeId).toBe(library.plans[0].id)
   })

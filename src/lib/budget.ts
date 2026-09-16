@@ -1,12 +1,11 @@
-export const STORAGE_KEY = 'little-budget-v1'
 export const currencies = ['EUR', 'USD', 'GBP', 'CHF', 'CAD', 'AUD'] as const
 export type Currency = typeof currencies[number]
 export type Category = { id: string; name: string; color: string; enabled: boolean }
 export type Option = { id: string; label: string }
 export type Choice = { id: string; name: string; categoryId: string | null; enabled: boolean; selectedId: string | null; options: Option[] }
 export type Purchase = { id: string; name: string; amount: number; quantity: number; priority: Priority; status: Status; link: string; categoryId: string | null; optionId: string | null; enabled: boolean; note: string }
-export type Plan = { version: 6; id: string; name: string; budget: number; currency: Currency; categories: Category[]; choices: Choice[]; items: Purchase[]; example: boolean }
-export type Library = { version: 1; activeId: string; plans: Plan[] }
+// `layout` is the order of what sits directly in a category: purchases outside any option and either-ors, mixed.
+export type Plan = { version: 7; id: string; name: string; budget: number; currency: Currency; categories: Category[]; choices: Choice[]; items: Purchase[]; layout: string[]; example: boolean }
 export const colors = ['sage', 'peach', 'blue', 'lavender', 'yellow'] as const
 // Ordered from the things you cannot do without down to the ones you could happily drop.
 export const priorities = ['must', 'high', 'medium', 'low', 'whim'] as const
@@ -80,18 +79,125 @@ export function isAlternative(item: Purchase, plan: Pick<Plan, 'categories' | 'c
   return choice !== undefined && choice.enabled && choice.selectedId !== item.optionId
 }
 
+// What marking a category or an either-or as bought covers: whatever counts there now. Of an either-or that is only
+// the picked option; purchases switched off, set aside or no longer needed are left as they are.
+export type BoughtScope = { categoryId: string | null } | { choiceId: string }
+
+export function boughtScope(plan: Plan, scope: BoughtScope): Purchase[] {
+  const inScope = 'choiceId' in scope
+    ? (item: Purchase) => choiceOf(plan.choices, item.optionId)?.id === scope.choiceId
+    : (item: Purchase) => item.categoryId === scope.categoryId
+  return plan.items.filter(item => inScope(item) && isIncluded(item, plan))
+}
+
+// Unmarking puts a bought purchase back to still planned; one that is no longer needed only changes if it is bought after all.
+export function setBought(plan: Plan, ids: string[], bought: boolean): Plan {
+  const marked = new Set(ids)
+  return {
+    ...plan,
+    items: plan.items.map(item => {
+      if (!marked.has(item.id)) return item
+      const status: Status = bought ? 'bought' : item.status === 'bought' ? 'planned' : item.status
+      return { ...item, status }
+    }),
+  }
+}
+
 // A pending move: which purchase, where it lands, and which purchase it should sit in front of.
 export type Move = { id: string; categoryId: string | null; optionId: string | null; before: string | null }
 
-// Moving is also how purchases are reordered: the list order is the order they are kept in.
+// Takes an entry out of a list and puts it back in front of `before`, or at the end.
+export function placeBefore<T extends { id: string }>(list: T[], entry: T, before: string | null) {
+  const rest = list.filter(candidate => candidate.id !== entry.id)
+  const at = before === null ? -1 : rest.findIndex(candidate => candidate.id === before)
+  const index = at < 0 ? rest.length : at
+  return [...rest.slice(0, index), entry, ...rest.slice(index)]
+}
+
+function placeIdBefore(ids: string[], id: string, before: string | null) {
+  return placeBefore(ids.map(entry => ({ id: entry })), { id }, before).map(entry => entry.id)
+}
+
+// What sits directly in a category, in the order it is shown. Anything not listed yet goes last, and ids of
+// things that are gone or tucked into an option are skipped, so the list never has to be kept in step by hand.
+export function layoutOf(plan: Pick<Plan, 'layout' | 'items' | 'choices'>): string[] {
+  const top = [...plan.items.filter(item => item.optionId === null).map(item => item.id), ...plan.choices.map(choice => choice.id)]
+  const present = new Set(top)
+  const listed = [...new Set(plan.layout)].filter(id => present.has(id))
+  const seen = new Set(listed)
+  return [...listed, ...top.filter(id => !seen.has(id))]
+}
+
+// Moving is also how purchases are reordered. Inside an option the list order is the order they are kept in;
+// on their own they share the category's order with its either-ors, so `before` can be either kind.
 export function movePurchase(plan: Plan, move: Move): Plan {
   const item = plan.items.find(candidate => candidate.id === move.id)
   if (!item || move.before === move.id) return plan
-  const rest = plan.items.filter(candidate => candidate.id !== move.id)
-  const at = move.before === null ? rest.length : rest.findIndex(candidate => candidate.id === move.before)
-  const index = at < 0 ? rest.length : at
-  const moved = { ...item, categoryId: move.categoryId, optionId: move.optionId }
-  return { ...plan, items: [...rest.slice(0, index), moved, ...rest.slice(index)] }
+  const items = placeBefore(plan.items, { ...item, categoryId: move.categoryId, optionId: move.optionId }, move.before)
+  const layout = move.optionId === null ? placeIdBefore(layoutOf(plan), item.id, move.before) : layoutOf(plan).filter(id => id !== item.id)
+  return { ...plan, items, layout }
+}
+
+// Categories are listed in the order they are kept in.
+export type CategoryMove = { id: string; before: string | null }
+
+export function moveCategory(plan: Plan, move: CategoryMove): Plan {
+  const category = plan.categories.find(candidate => candidate.id === move.id)
+  if (!category || move.before === move.id) return plan
+  return { ...plan, categories: placeBefore(plan.categories, category, move.before) }
+}
+
+// An either-or takes the purchases in its options along, so they always live in the same category as it does.
+export type ChoiceMove = { id: string; categoryId: string | null; before: string | null }
+
+export function moveChoice(plan: Plan, move: ChoiceMove): Plan {
+  const choice = plan.choices.find(candidate => candidate.id === move.id)
+  if (!choice || move.before === move.id) return plan
+  const owned = new Set(choice.options.map(option => option.id))
+  return {
+    ...plan,
+    choices: placeBefore(plan.choices, { ...choice, categoryId: move.categoryId }, move.before),
+    items: move.categoryId === choice.categoryId ? plan.items : plan.items.map(item => item.optionId !== null && owned.has(item.optionId) ? { ...item, categoryId: move.categoryId } : item),
+    layout: placeIdBefore(layoutOf(plan), choice.id, move.before),
+  }
+}
+
+// Options are reordered within their own either-or, in front of `before` or last.
+export type OptionMove = { id: string; before: string | null }
+
+export function moveOption(plan: Plan, move: OptionMove): Plan {
+  const choice = choiceOf(plan.choices, move.id)
+  const option = choice?.options.find(candidate => candidate.id === move.id)
+  if (!choice || !option || move.before === move.id) return plan
+  return { ...plan, choices: plan.choices.map(candidate => candidate.id === choice.id ? { ...candidate, options: placeBefore(candidate.options, option, move.before) } : candidate) }
+}
+
+export function deletePurchase(plan: Plan, id: string): Plan {
+  const next = { ...plan, items: plan.items.filter(item => item.id !== id) }
+  return { ...next, layout: layoutOf(next) }
+}
+
+// An either-or's purchases go with it, or stay where it stood as plain purchases, option by option.
+export function deleteChoice(plan: Plan, id: string, withPurchases: boolean): Plan {
+  const choice = plan.choices.find(candidate => candidate.id === id)
+  if (!choice) return plan
+  const inside = choice.options.flatMap(option => plan.items.filter(item => item.optionId === option.id).map(item => item.id))
+  const gone = new Set(inside)
+  return {
+    ...plan,
+    choices: plan.choices.filter(candidate => candidate.id !== id),
+    items: withPurchases ? plan.items.filter(item => !gone.has(item.id)) : plan.items.map(item => gone.has(item.id) ? { ...item, optionId: null } : item),
+    layout: layoutOf(plan).flatMap(entry => entry !== id ? [entry] : withPurchases ? [] : inside),
+  }
+}
+
+// A category's purchases and either-ors go with it, or move to Uncategorized in the order they had.
+export function deleteCategory(plan: Plan, id: string, withContents: boolean): Plan {
+  const categories = plan.categories.filter(category => category.id !== id)
+  const next = withContents
+    ? { ...plan, categories, choices: plan.choices.filter(choice => choice.categoryId !== id), items: plan.items.filter(item => item.categoryId !== id) }
+    : { ...plan, categories, choices: plan.choices.map(choice => choice.categoryId === id ? { ...choice, categoryId: null } : choice), items: plan.items.map(item => item.categoryId === id ? { ...item, categoryId: null } : item) }
+  return { ...next, layout: layoutOf(next) }
 }
 
 export function summarize(plan: Plan) {
@@ -121,12 +227,12 @@ export function withValidSelection(choice: Choice): Choice {
 }
 
 export function emptyPlan(name: string, currency: Currency = 'EUR'): Plan {
-  return { version: 6, id: crypto.randomUUID(), name, budget: 0, currency, categories: [], choices: [], items: [], example: false }
+  return { version: 7, id: crypto.randomUUID(), name, budget: 0, currency, categories: [], choices: [], items: [], layout: [], example: false }
 }
 
 export function examplePlan(name: string): Plan {
   return {
-    version: 6, id: crypto.randomUUID(), name, budget: 0, currency: 'EUR', example: true,
+    version: 7, id: crypto.randomUUID(), name, budget: 0, currency: 'EUR', example: true, layout: [],
     categories: [
       { id: 'kitchen', name: 'Kitchen refresh', color: 'sage', enabled: true },
       { id: 'office', name: 'Home office', color: 'blue', enabled: true },
@@ -153,13 +259,21 @@ export function examplePlan(name: string): Plan {
   }
 }
 
+export function isAmount(amount: unknown): amount is number {
+  return typeof amount === 'number' && Number.isSafeInteger(amount) && amount >= 0 && amount <= MAX_AMOUNT
+}
+
+export function validCategories(categories: Category[]) {
+  if (!categories.every(c => c && typeof c.id === 'string' && typeof c.name === 'string' && typeof c.enabled === 'boolean' && colors.includes(c.color as typeof colors[number]))) return false
+  return new Set(categories.map(c => c.id)).size === categories.length
+}
+
 export function validatePlan(value: unknown): value is Plan {
   if (!value || typeof value !== 'object') return false
   const plan = value as Plan
-  const validAmount = (amount: unknown) => typeof amount === 'number' && Number.isSafeInteger(amount) && amount >= 0 && amount <= MAX_AMOUNT
-  if (plan.version !== 6 || typeof plan.id !== 'string' || !plan.id || typeof plan.name !== 'string' || typeof plan.example !== 'boolean' || !validAmount(plan.budget) || !currencies.includes(plan.currency) || !Array.isArray(plan.categories) || !Array.isArray(plan.choices) || !Array.isArray(plan.items)) return false
-  if (!plan.categories.every(c => c && typeof c.id === 'string' && typeof c.name === 'string' && typeof c.enabled === 'boolean' && colors.includes(c.color as typeof colors[number]))) return false
-  if (new Set(plan.categories.map(c => c.id)).size !== plan.categories.length) return false
+  if (plan.version !== 7 || typeof plan.id !== 'string' || !plan.id || typeof plan.name !== 'string' || typeof plan.example !== 'boolean' || !isAmount(plan.budget) || !currencies.includes(plan.currency) || !Array.isArray(plan.categories) || !Array.isArray(plan.choices) || !Array.isArray(plan.items)) return false
+  if (!Array.isArray(plan.layout) || !plan.layout.every(id => typeof id === 'string')) return false
+  if (!validCategories(plan.categories)) return false
   if (!plan.choices.every(c => c && typeof c.id === 'string' && typeof c.name === 'string' && typeof c.enabled === 'boolean' && Array.isArray(c.options)
     && (c.categoryId === null || plan.categories.some(category => category.id === c.categoryId))
     && c.options.every(o => o && typeof o.id === 'string' && typeof o.label === 'string')
@@ -168,8 +282,8 @@ export function validatePlan(value: unknown): value is Plan {
   if (new Set(optionIds).size !== optionIds.length) return false
   if (new Set(plan.choices.map(c => c.id)).size !== plan.choices.length) return false
   if (new Set(plan.items.map(i => i?.id)).size !== plan.items.length) return false
-  return plan.items.every(i => i && typeof i.id === 'string' && typeof i.name === 'string' && typeof i.note === 'string' && typeof i.enabled === 'boolean' && validAmount(i.amount)
-    && Number.isSafeInteger(i.quantity) && i.quantity >= 1 && i.quantity <= MAX_QUANTITY && validAmount(lineTotal(i))
+  return plan.items.every(i => i && typeof i.id === 'string' && typeof i.name === 'string' && typeof i.note === 'string' && typeof i.enabled === 'boolean' && isAmount(i.amount)
+    && Number.isSafeInteger(i.quantity) && i.quantity >= 1 && i.quantity <= MAX_QUANTITY && isAmount(lineTotal(i))
     && priorities.includes(i.priority) && statuses.includes(i.status)
     && typeof i.link === 'string' && i.link.length <= MAX_LINK
     && (i.categoryId === null || plan.categories.some(c => c.id === i.categoryId))
@@ -177,13 +291,15 @@ export function validatePlan(value: unknown): value is Plan {
 }
 
 // Plans saved by earlier versions: v1 had no either-ors, and before v4 a plan had no name of its own.
+// Before v7 a category listed its purchases above its either-ors, which is what an empty layout gives.
 export function upgradePlan(value: unknown, fallbackName = 'Imported plan'): unknown {
   const saved = value as { version?: number; id?: unknown; name?: unknown; example?: unknown; items?: Purchase[] }
   if (!saved || typeof saved !== 'object' || !Array.isArray(saved.items)) return value
-  if (saved.version === undefined || ![1, 2, 3, 4, 5].includes(saved.version)) return value
+  if (saved.version === undefined || ![1, 2, 3, 4, 5, 6].includes(saved.version)) return value
   const upgraded: Record<string, unknown> = {
     ...saved,
-    version: 6,
+    version: 7,
+    layout: [],
     id: typeof saved.id === 'string' && saved.id ? saved.id : crypto.randomUUID(),
     name: typeof saved.name === 'string' && saved.name.trim() ? saved.name : fallbackName,
     example: saved.example === true,
@@ -201,44 +317,13 @@ export function upgradePlan(value: unknown, fallbackName = 'Imported plan'): unk
   return upgraded
 }
 
-export function validateLibrary(value: unknown): value is Library {
-  const library = value as Library
-  if (!library || typeof library !== 'object' || library.version !== 1 || !Array.isArray(library.plans) || !library.plans.length) return false
-  if (!library.plans.every(validatePlan)) return false
-  if (new Set(library.plans.map(plan => plan.id)).size !== library.plans.length) return false
-  return library.plans.some(plan => plan.id === library.activeId)
-}
-
 export function exportPlan(plan: Plan) {
   return JSON.stringify(plan, null, 2)
 }
 
-export function exportLibrary(library: Library) {
-  return JSON.stringify(library, null, 2)
-}
-
-export type Imported = { kind: 'plan'; plan: Plan } | { kind: 'library'; library: Library }
-
-// Accepts a single plan or a whole library, written by any version of the app.
-export function importFile(text: string, fallbackName = 'Imported plan'): Imported | null {
-  try {
-    const parsed: unknown = JSON.parse(text)
-    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Library).plans)) {
-      const source = parsed as Library
-      const library = { version: 1, activeId: source.activeId, plans: source.plans.map((plan, index) => upgradePlan(plan, `${fallbackName} ${index + 1}`)) } as Library
-      if (!library.plans.some(plan => plan.id === library.activeId)) library.activeId = library.plans[0]?.id
-      return validateLibrary(library) ? { kind: 'library', library } : null
-    }
-    const plan = upgradePlan(parsed, fallbackName)
-    return validatePlan(plan) ? { kind: 'plan', plan } : null
-  } catch {
-    return null
-  }
-}
-
-// A plan joining a library needs an identity of its own.
-export function withFreshId(plan: Plan, taken: Plan[]): Plan {
-  return taken.some(existing => existing.id === plan.id) ? { ...plan, id: crypto.randomUUID() } : plan
+// A plan or budget joining a library needs an identity of its own.
+export function withFreshId<T extends { id: string }>(entry: T, taken: { id: string }[]): T {
+  return taken.some(existing => existing.id === entry.id) ? { ...entry, id: crypto.randomUUID() } : entry
 }
 
 export function exportFilename(now = new Date(), name?: string) {
@@ -247,30 +332,3 @@ export function exportFilename(now = new Date(), name?: string) {
   return `little-budget-${slug ? `${slug}-` : ''}${stamp}.json`
 }
 
-export function newLibrary(plan: Plan): Library {
-  return { version: 1, activeId: plan.id, plans: [plan] }
-}
-
-// The stored value is a library; anything older is a lone plan and gets wrapped in one.
-export function loadLibrary(exampleName: string, importedName: string): { library: Library; corrupted: boolean } {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (!saved) return { library: newLibrary(examplePlan(exampleName)), corrupted: false }
-    const stored: unknown = JSON.parse(saved)
-    if (stored && typeof stored === 'object' && Array.isArray((stored as Library).plans)) {
-      const library = stored as Library
-      const upgraded = { ...library, plans: library.plans.map(plan => upgradePlan(plan, importedName)) } as Library
-      if (!validateLibrary(upgraded)) throw new Error('Invalid saved library')
-      return { library: upgraded, corrupted: false }
-    }
-    const plan = upgradePlan(stored, importedName)
-    if (!validatePlan(plan)) throw new Error('Invalid saved plan')
-    return { library: newLibrary(plan), corrupted: false }
-  } catch {
-    return { library: newLibrary(emptyPlan(exampleName)), corrupted: true }
-  }
-}
-
-export function saveLibrary(library: Library) {
-  localStorage.setItem(STORAGE_KEY, exportLibrary(library))
-}
